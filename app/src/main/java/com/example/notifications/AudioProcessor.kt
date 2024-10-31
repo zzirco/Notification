@@ -6,7 +6,6 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.util.Log
 import com.google.gson.JsonParser
-import org.apache.commons.math3.complex.Complex
 import org.apache.commons.math3.transform.FastFourierTransformer
 import org.apache.commons.math3.transform.DftNormalization
 import org.apache.commons.math3.transform.TransformType
@@ -212,6 +211,7 @@ class AudioProcessor(private val context: Context) : AutoCloseable {
                     freq <= freqPoints[i + 1] -> {
                         (freq - freqPoints[i]) / (freqPoints[i + 1] - freqPoints[i])
                     }
+
                     else -> {
                         (freqPoints[i + 2] - freq) / (freqPoints[i + 2] - freqPoints[i + 1])
                     }
@@ -321,16 +321,20 @@ class AudioProcessor(private val context: Context) : AutoCloseable {
             val spectrogram = computeSpectrogram(audio)
             val melSpectrogram = applyMelFilters(spectrogram)
             val normalizedFeatures = normalize(melSpectrogram)
-
-            // 패딩 또는 트리밍 적용
             val paddedFeatures = padOrTrimFeatures(normalizedFeatures)
 
-            val inputShape = longArrayOf(1, EXPECTED_LENGTH.toLong(), NUM_MEL_FILTERS.toLong())
-            val flattenedInput = flattenFeatures(paddedFeatures)  // paddedFeatures 사용
+            // 전처리된 데이터를 파일로 저장
+            savePreprocessedData(
+                audio,
+                spectrogram,
+                melSpectrogram,
+                normalizedFeatures,
+                paddedFeatures,
+                filePath
+            )
 
-            Log.d(TAG, "Features before padding: ${normalizedFeatures.size} x ${normalizedFeatures[0].size}")
-            Log.d(TAG, "Features after padding: ${paddedFeatures.size} x ${paddedFeatures[0].size}")
-            Log.d(TAG, "Flattened input size: ${flattenedInput.size}")
+            val inputShape = longArrayOf(1, EXPECTED_LENGTH.toLong(), NUM_MEL_FILTERS.toLong())
+            val flattenedInput = flattenFeatures(paddedFeatures)
 
             return OnnxTensor.createTensor(
                 env,
@@ -339,7 +343,8 @@ class AudioProcessor(private val context: Context) : AutoCloseable {
             ).use { inputTensor ->
                 onnxSession?.run(mapOf("input_values" to inputTensor))?.use { output ->
                     val outputTensor = output[0].value as Array<FloatArray>
-                    val predictionIdx = outputTensor[0].indices.maxByOrNull { outputTensor[0][it] } ?: 0
+                    val predictionIdx =
+                        outputTensor[0].indices.maxByOrNull { outputTensor[0][it] } ?: 0
                     mapIndexToLabel(predictionIdx)
                 } ?: throw RuntimeException("Failed to run inference")
             }
@@ -349,10 +354,74 @@ class AudioProcessor(private val context: Context) : AutoCloseable {
         }
     }
 
+    private fun savePreprocessedData(
+        audio: FloatArray,
+        spectrogram: Array<FloatArray>,
+        melSpectrogram: Array<FloatArray>,
+        normalizedFeatures: Array<FloatArray>,
+        paddedFeatures: Array<FloatArray>,
+        originalFilePath: String
+    ) {
+        try {
+            // 프로젝트의 src/debug/assets 폴더 경로 생성
+            val projectPath = context.applicationInfo.sourceDir
+                .substringBefore("app/build")
+            val debugDir = File(projectPath, "app/src/debug/assets/debug_output")
+
+            if (!debugDir.exists()) {
+                debugDir.mkdirs()
+            }
+
+            val timestamp = System.currentTimeMillis()
+            val baseFileName = File(originalFilePath).nameWithoutExtension
+
+            // 리샘플링된 오디오 저장
+            File(debugDir, "${baseFileName}_resampled_$timestamp.txt").writeText(
+                "Resampled Audio (${audio.size} samples):\n" +
+                        audio.joinToString("\n")
+            )
+
+            // 스펙트로그램 저장
+            File(debugDir, "${baseFileName}_spectrogram_$timestamp.txt").writeText(
+                "Spectrogram (${spectrogram.size} x ${spectrogram[0].size}):\n" +
+                        spectrogram.joinToString("\n") { row -> row.joinToString(",") }
+            )
+
+            // Mel 스펙트로그램 저장
+            File(debugDir, "${baseFileName}_melspectrogram_$timestamp.txt").writeText(
+                "Mel Spectrogram (${melSpectrogram.size} x ${melSpectrogram[0].size}):\n" +
+                        melSpectrogram.joinToString("\n") { row -> row.joinToString(",") }
+            )
+
+            // 정규화된 특성 저장
+            File(debugDir, "${baseFileName}_normalized_$timestamp.txt").writeText(
+                "Normalized Features (${normalizedFeatures.size} x ${normalizedFeatures[0].size}):\n" +
+                        normalizedFeatures.joinToString("\n") { row -> row.joinToString(",") }
+            )
+
+            // 패딩된 특성 저장
+            File(debugDir, "${baseFileName}_padded_$timestamp.txt").writeText(
+                "Padded Features (${paddedFeatures.size} x ${paddedFeatures[0].size}):\n" +
+                        paddedFeatures.joinToString("\n") { row -> row.joinToString(",") }
+            )
+
+            Log.d(TAG, "Preprocessed data saved to ${debugDir.absolutePath}")
+
+            // 저장된 파일 목록 로깅
+            debugDir.listFiles()?.forEach { file ->
+                Log.d(TAG, "Saved file: ${file.name}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save preprocessed data", e)
+            Log.e(TAG, "Error details:", e)
+        }
+    }
+
     private fun loadModelMetadata() {
         try {
             // assets에서 라벨 정보 JSON 파일 읽기
-            val labelsJson = context.assets.open("labels.json").bufferedReader().use { it.readText() }
+            val labelsJson =
+                context.assets.open("labels.json").bufferedReader().use { it.readText() }
 
             labelMap = JsonParser.parseString(labelsJson)
                 .asJsonObject
@@ -364,17 +433,12 @@ class AudioProcessor(private val context: Context) : AutoCloseable {
             Log.d(TAG, "Loaded label map from JSON: $labelMap")
         } catch (e: Exception) {
             Log.e(TAG, "Error loading labels.json", e)
-            // 기본값 사용
-            labelMap = mapOf(
-                0 to "Vehicle",
-                1 to "Speech",
-                2 to "Music"
-            )
             Log.w(TAG, "Using default label map due to error: ${e.message}")
         }
     }
 
     private fun mapIndexToLabel(index: Int): String {
+        Log.d("소리 유형", index.toString())
         return labelMap[index] ?: "Unknown"
     }
 }
